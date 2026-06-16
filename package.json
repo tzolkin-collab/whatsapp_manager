@@ -1,0 +1,28 @@
+{
+  "name": "whatsapp-evolution-mcp",
+  "version": "1.0.0",
+  "description": "MCP Server for WhatsApp Evolution API v2",
+  "main": "build/index.js",
+  "type": "module",
+  "bin": {
+    "whatsapp-evolution-mcp": "./build/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node build/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^20.17.9",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
