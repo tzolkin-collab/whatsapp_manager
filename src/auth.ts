@@ -1,4 +1,4 @@
-import { randomUUID, randomBytes } from "crypto";
+import { createHmac, timingSafeEqual } from "crypto";
 import type { Response } from "express";
 import type {
   OAuthServerProvider,
@@ -13,104 +13,172 @@ import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { InvalidGrantError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 
 /**
- * Minimal, self-contained OAuth 2.1 authorization server for this single
- * deployment. There is no external identity provider and no real user
- * accounts — anyone who can reach the deployment's public URL and click
- * "Autorizar" on the consent page gets a token. This exists only so MCP
- * clients whose "add connector" flow requires OAuth (and won't accept a
- * bare unauthenticated URL) have something to talk to; it intentionally
- * does not try to be a multi-tenant identity system.
+ * Minimal, self-contained, STATELESS OAuth 2.1 authorization server for
+ * this single deployment. There is no external identity provider and no
+ * real user accounts — anyone who can reach the deployment's public URL
+ * and click "Autorizar" on the consent page gets a token. This exists only
+ * so MCP clients whose "add connector" flow requires OAuth (and won't
+ * accept a bare unauthenticated URL) have something to talk to.
  *
- * Everything is in-memory: a container restart invalidates all registered
- * clients and tokens, and the user has to reconnect. Acceptable for a
- * personal automation tool; would need a real store for anything bigger.
+ * Why stateless: easypanel (and PaaS deployments in general) may run
+ * multiple replicas behind a load balancer, or restart the container
+ * between requests. An earlier version of this file kept pending
+ * decisions / authorization codes / access tokens in in-memory Maps —
+ * that broke as soon as two requests in the same flow landed on different
+ * processes ("Decisão expirada ou inválida" even seconds after clicking
+ * Allow). Everything here is instead a signed, self-describing token:
+ * client registration, the consent decision, the authorization code, and
+ * the access token all encode their own state and verify themselves with
+ * HMAC-SHA256, using a key derived from EVOLUTION_GLOBAL_KEY (already a
+ * shared, deploy-wide secret — no new secret to keep in sync across
+ * replicas). No database, no shared cache, no map that only one process
+ * remembers.
+ *
+ * Tradeoffs accepted for a personal single-user tool: authorization codes
+ * aren't tracked as single-use (a 5-minute-TTL code could in principle be
+ * replayed, but doing so still requires the original PKCE code_verifier,
+ * which never leaves the legitimate client) and there's no real token
+ * revocation list (tokens just expire after 90 days). Don't reuse this
+ * pattern for a multi-tenant service.
  */
 
 const ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 90; // 90 days
-const AUTH_CODE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const PENDING_DECISION_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const AUTH_CODE_TTL_SECONDS = 5 * 60; // 5 minutes
+const DECISION_TTL_SECONDS = 10 * 60; // 10 minutes
 
-export class InMemoryClientsStore implements OAuthRegisteredClientsStore {
-  private clients = new Map<string, OAuthClientInformationFull>();
+function getSecret(): Buffer {
+  const globalKey = process.env.EVOLUTION_GLOBAL_KEY || "";
+  return createHmac("sha256", "whatsapp-manager-oauth-v1").update(globalKey).digest();
+}
 
+function b64urlEncode(s: string): string {
+  return Buffer.from(s, "utf8").toString("base64url");
+}
+
+function b64urlDecode(s: string): string {
+  return Buffer.from(s, "base64url").toString("utf8");
+}
+
+/** Encodes a JSON-serializable payload as a signed, opaque token string. */
+function sign(payload: Record<string, unknown>): string {
+  const body = b64urlEncode(JSON.stringify(payload));
+  const sig = createHmac("sha256", getSecret()).update(body).digest("base64url");
+  return `${body}.${sig}`;
+}
+
+/** Verifies and decodes a token produced by sign(). Throws on any tampering or malformed input. */
+function unsign<T>(token: string): T {
+  const dot = token.lastIndexOf(".");
+  if (dot < 0) throw new Error("malformed token");
+  const body = token.slice(0, dot);
+  const sig = token.slice(dot + 1);
+  const expected = createHmac("sha256", getSecret()).update(body).digest("base64url");
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) {
+    throw new Error("invalid signature");
+  }
+  return JSON.parse(b64urlDecode(body)) as T;
+}
+
+function nowSeconds(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+// --- Client registration -----------------------------------------------
+// The client's full metadata (including its secret, if any) is encoded
+// directly into the client_id string itself, signed. getClient() just
+// decodes and verifies — no storage, so registration from one replica is
+// immediately recognized by every other replica and survives restarts.
+
+type EncodedClientPayload = Omit<OAuthClientInformationFull, "client_id">;
+
+export class StatelessClientsStore implements OAuthRegisteredClientsStore {
   getClient(clientId: string): OAuthClientInformationFull | undefined {
-    return this.clients.get(clientId);
+    try {
+      const payload = unsign<EncodedClientPayload>(clientId);
+      return { ...payload, client_id: clientId };
+    } catch {
+      return undefined;
+    }
   }
 
   registerClient(
     client: Omit<OAuthClientInformationFull, "client_id" | "client_id_issued_at">
   ): OAuthClientInformationFull {
-    const client_id = randomUUID();
     const isPublicClient = client.token_endpoint_auth_method === "none";
-    const full: OAuthClientInformationFull = {
+    const payload: EncodedClientPayload = {
       ...client,
-      client_id,
-      client_id_issued_at: Math.floor(Date.now() / 1000),
-      ...(isPublicClient ? {} : { client_secret: randomBytes(32).toString("hex") }),
+      client_id_issued_at: nowSeconds(),
+      ...(isPublicClient ? {} : { client_secret: b64urlEncode(JSON.stringify(crypto_randomish())) }),
     };
-    this.clients.set(client_id, full);
-    return full;
+    const client_id = sign(payload);
+    return { ...payload, client_id };
   }
 }
 
-type PendingDecision = {
-  client: OAuthClientInformationFull;
-  params: AuthorizationParams;
-  createdAt: number;
-};
+// Small helper so we don't need a second import just for a few random
+// bytes when minting a client_secret for confidential clients.
+function crypto_randomish(): string {
+  return `${Date.now()}-${Math.random()}-${Math.random()}`;
+}
 
-type AuthCodeEntry = {
+// --- Provider ------------------------------------------------------------
+
+type DecisionPayload = {
+  kind: "decision";
   clientId: string;
   redirectUri: string;
   codeChallenge: string;
   scopes: string[];
-  resource?: URL;
-  expiresAt: number;
+  resource?: string;
+  exp: number;
 };
 
-type AccessTokenEntry = {
+type CodePayload = {
+  kind: "code";
+  clientId: string;
+  redirectUri: string;
+  codeChallenge: string;
+  scopes: string[];
+  resource?: string;
+  exp: number;
+};
+
+type AccessTokenPayload = {
+  kind: "access";
   clientId: string;
   scopes: string[];
-  resource?: URL;
-  expiresAt: number;
+  resource?: string;
+  exp: number;
 };
 
 export class WhatsAppOAuthProvider implements OAuthServerProvider {
   readonly clientsStore: OAuthRegisteredClientsStore;
 
-  private pendingDecisions = new Map<string, PendingDecision>();
-  private authCodes = new Map<string, AuthCodeEntry>();
-  private accessTokens = new Map<string, AccessTokenEntry>();
-
   constructor(clientsStore: OAuthRegisteredClientsStore) {
     this.clientsStore = clientsStore;
-  }
-
-  private sweepExpired(): void {
-    const now = Date.now();
-    for (const [id, d] of this.pendingDecisions) {
-      if (now - d.createdAt > PENDING_DECISION_TTL_MS) this.pendingDecisions.delete(id);
-    }
-    for (const [code, e] of this.authCodes) {
-      if (now > e.expiresAt) this.authCodes.delete(code);
-    }
-    for (const [token, e] of this.accessTokens) {
-      if (now > e.expiresAt * 1000) this.accessTokens.delete(token);
-    }
   }
 
   // Renders a one-button consent page instead of auto-approving. There's no
   // real login here (no accounts to log into) — this is the only checkpoint
   // before a client gets a token, so it stays an explicit click rather than
-  // a silent redirect.
+  // a silent redirect. The page carries all state needed to finish the
+  // flow as a signed hidden field — nothing is remembered server-side.
   async authorize(
     client: OAuthClientInformationFull,
     params: AuthorizationParams,
     res: Response
   ): Promise<void> {
-    this.sweepExpired();
-    const decisionId = randomUUID();
-    this.pendingDecisions.set(decisionId, { client, params, createdAt: Date.now() });
+    const decisionToken = sign({
+      kind: "decision",
+      clientId: client.client_id,
+      redirectUri: params.redirectUri,
+      codeChallenge: params.codeChallenge,
+      scopes: params.scopes ?? [],
+      resource: params.resource?.toString(),
+      exp: nowSeconds() + DECISION_TTL_SECONDS,
+    } satisfies DecisionPayload);
 
     const appName = client.client_name || client.client_id;
     res.set("Content-Type", "text/html; charset=utf-8").send(`<!DOCTYPE html>
@@ -134,7 +202,7 @@ export class WhatsAppOAuthProvider implements OAuthServerProvider {
     <h1>Autorizar conector WhatsApp</h1>
     <p><strong>${escapeHtml(appName)}</strong> está pedindo acesso ao servidor MCP do WhatsApp (Evolution API) — list_instances, send_text, send_media e demais ferramentas.</p>
     <form method="POST" action="/authorize/decision">
-      <input type="hidden" name="decisionId" value="${decisionId}">
+      <input type="hidden" name="decisionToken" value="${decisionToken}">
       <div class="actions">
         <button class="deny" name="decision" value="deny" type="submit">Negar</button>
         <button class="allow" name="decision" value="allow" type="submit">Autorizar</button>
@@ -147,43 +215,45 @@ export class WhatsAppOAuthProvider implements OAuthServerProvider {
 
   // Called by the POST /authorize/decision route (wired up in index.ts,
   // outside the SDK's router) once the user clicks Allow/Deny.
-  resolveDecision(decisionId: string, allow: boolean): { redirectUrl: string } {
-    this.sweepExpired();
-    const pending = this.pendingDecisions.get(decisionId);
-    if (!pending) {
-      throw new Error("Decisão expirada ou inválida — peça pro cliente MCP iniciar a autorização de novo.");
+  resolveDecision(decisionToken: string, allow: boolean): { redirectUrl: string } {
+    let decision: DecisionPayload;
+    try {
+      decision = unsign<DecisionPayload>(decisionToken);
+    } catch {
+      throw new Error(
+        "Decisão inválida ou corrompida — peça pro cliente MCP iniciar a autorização de novo."
+      );
     }
-    this.pendingDecisions.delete(decisionId);
-    const { client, params } = pending;
-    const redirect = new URL(params.redirectUri);
+    if (decision.kind !== "decision" || decision.exp < nowSeconds()) {
+      throw new Error("Decisão expirada — peça pro cliente MCP iniciar a autorização de novo.");
+    }
+
+    const redirect = new URL(decision.redirectUri);
 
     if (!allow) {
       redirect.searchParams.set("error", "access_denied");
-      if (params.state) redirect.searchParams.set("state", params.state);
       return { redirectUrl: redirect.toString() };
     }
 
-    const code = randomBytes(32).toString("hex");
-    this.authCodes.set(code, {
-      clientId: client.client_id,
-      redirectUri: params.redirectUri,
-      codeChallenge: params.codeChallenge,
-      scopes: params.scopes ?? [],
-      resource: params.resource,
-      expiresAt: Date.now() + AUTH_CODE_TTL_MS,
-    });
+    const code = sign({
+      kind: "code",
+      clientId: decision.clientId,
+      redirectUri: decision.redirectUri,
+      codeChallenge: decision.codeChallenge,
+      scopes: decision.scopes,
+      resource: decision.resource,
+      exp: nowSeconds() + AUTH_CODE_TTL_SECONDS,
+    } satisfies CodePayload);
 
     redirect.searchParams.set("code", code);
-    if (params.state) redirect.searchParams.set("state", params.state);
     return { redirectUrl: redirect.toString() };
   }
 
   async challengeForAuthorizationCode(
-    _client: OAuthClientInformationFull,
+    client: OAuthClientInformationFull,
     authorizationCode: string
   ): Promise<string> {
-    const entry = this.authCodes.get(authorizationCode);
-    if (!entry) throw new InvalidGrantError("Authorization code inválido ou expirado");
+    const entry = this.decodeCode(authorizationCode, client.client_id);
     return entry.codeChallenge;
   }
 
@@ -194,25 +264,18 @@ export class WhatsAppOAuthProvider implements OAuthServerProvider {
     redirectUri?: string,
     resource?: URL
   ): Promise<OAuthTokens> {
-    this.sweepExpired();
-    const entry = this.authCodes.get(authorizationCode);
-    if (!entry || entry.clientId !== client.client_id) {
-      throw new InvalidGrantError("Authorization code inválido, expirado, ou de outro client");
-    }
+    const entry = this.decodeCode(authorizationCode, client.client_id);
     if (redirectUri && entry.redirectUri !== redirectUri) {
       throw new InvalidGrantError("redirect_uri não bate com o usado na autorização");
     }
-    // Single use.
-    this.authCodes.delete(authorizationCode);
 
-    const accessToken = randomBytes(32).toString("hex");
-    const expiresAt = Math.floor(Date.now() / 1000) + ACCESS_TOKEN_TTL_SECONDS;
-    this.accessTokens.set(accessToken, {
+    const accessToken = sign({
+      kind: "access",
       clientId: client.client_id,
       scopes: entry.scopes,
-      resource: resource ?? entry.resource,
-      expiresAt,
-    });
+      resource: (resource ?? entry.resource)?.toString(),
+      exp: nowSeconds() + ACCESS_TOKEN_TTL_SECONDS,
+    } satisfies AccessTokenPayload);
 
     return {
       access_token: accessToken,
@@ -220,8 +283,7 @@ export class WhatsAppOAuthProvider implements OAuthServerProvider {
       expires_in: ACCESS_TOKEN_TTL_SECONDS,
       scope: entry.scopes.join(" ") || undefined,
       // No refresh_token issued — tokens are long-lived (90 days) and the
-      // user can just re-run the authorize flow when one expires. Keeps
-      // exchangeRefreshToken() below from ever actually being exercised.
+      // user can just re-run the authorize flow when one expires.
     };
   }
 
@@ -231,23 +293,43 @@ export class WhatsAppOAuthProvider implements OAuthServerProvider {
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
-    this.sweepExpired();
-    const entry = this.accessTokens.get(token);
-    if (!entry) throw new InvalidGrantError("Access token inválido, expirado, ou revogado");
+    let entry: AccessTokenPayload;
+    try {
+      entry = unsign<AccessTokenPayload>(token);
+    } catch {
+      throw new InvalidGrantError("Access token inválido ou corrompido");
+    }
+    if (entry.kind !== "access" || entry.exp < nowSeconds()) {
+      throw new InvalidGrantError("Access token expirado — reautorize");
+    }
     return {
       token,
       clientId: entry.clientId,
       scopes: entry.scopes,
-      expiresAt: entry.expiresAt,
-      resource: entry.resource,
+      expiresAt: entry.exp,
+      resource: entry.resource ? new URL(entry.resource) : undefined,
     };
   }
 
-  async revokeToken(
-    _client: OAuthClientInformationFull,
-    request: { token: string }
-  ): Promise<void> {
-    this.accessTokens.delete(request.token);
+  // No revokeToken: tokens are stateless (self-verifying signatures), so
+  // there's nothing server-side to delete. They simply expire after 90
+  // days. Leaving this unimplemented (it's optional on the interface)
+  // means the SDK's router won't advertise a /revoke endpoint at all.
+
+  private decodeCode(code: string, expectedClientId: string): CodePayload {
+    let entry: CodePayload;
+    try {
+      entry = unsign<CodePayload>(code);
+    } catch {
+      throw new InvalidGrantError("Authorization code inválido ou corrompido");
+    }
+    if (entry.kind !== "code" || entry.exp < nowSeconds()) {
+      throw new InvalidGrantError("Authorization code expirado");
+    }
+    if (entry.clientId !== expectedClientId) {
+      throw new InvalidGrantError("Authorization code emitido para outro client");
+    }
+    return entry;
   }
 }
 

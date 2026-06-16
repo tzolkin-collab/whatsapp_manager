@@ -7,7 +7,7 @@ import express from "express";
 import { z } from "zod";
 import dotenv from "dotenv";
 import { EvolutionClient } from "./client.js";
-import { InMemoryClientsStore, WhatsAppOAuthProvider } from "./auth.js";
+import { StatelessClientsStore, WhatsAppOAuthProvider } from "./auth.js";
 
 // Load environment variables for local testing
 dotenv.config();
@@ -40,7 +40,7 @@ const client = new EvolutionClient(apiUrl, globalKey);
 // Single shared OAuth provider for the whole process — every SSE connection
 // reuses it (only the McpServer itself needs to be per-connection, see
 // createServer() below).
-const oauthProvider = new WhatsAppOAuthProvider(new InMemoryClientsStore());
+const oauthProvider = new WhatsAppOAuthProvider(new StatelessClientsStore());
 
 // Helper for error formatting in tool responses
 const wrapResult = async (fn: () => Promise<any>) => {
@@ -326,14 +326,14 @@ async function run() {
   // Consent screen submits here. Not part of the SDK router — this is the
   // human-in-the-loop step before authorize() hands back a code.
   app.post("/authorize/decision", express.urlencoded({ extended: false }), (req, res) => {
-    const decisionId = req.body?.decisionId as string | undefined;
+    const decisionToken = req.body?.decisionToken as string | undefined;
     const allow = req.body?.decision === "allow";
-    if (!decisionId) {
-      res.status(400).send("Missing decisionId");
+    if (!decisionToken) {
+      res.status(400).send("Missing decisionToken");
       return;
     }
     try {
-      const { redirectUrl } = oauthProvider.resolveDecision(decisionId, allow);
+      const { redirectUrl } = oauthProvider.resolveDecision(decisionToken, allow);
       res.redirect(redirectUrl);
     } catch (err: any) {
       res.status(400).send(err.message || "Decisão inválida");
