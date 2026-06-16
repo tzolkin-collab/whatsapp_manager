@@ -132,6 +132,7 @@ type DecisionPayload = {
   codeChallenge: string;
   scopes: string[];
   resource?: string;
+  state?: string;
   exp: number;
 };
 
@@ -177,6 +178,7 @@ export class WhatsAppOAuthProvider implements OAuthServerProvider {
       codeChallenge: params.codeChallenge,
       scopes: params.scopes ?? [],
       resource: params.resource?.toString(),
+      state: params.state,
       exp: nowSeconds() + DECISION_TTL_SECONDS,
     } satisfies DecisionPayload);
 
@@ -229,6 +231,12 @@ export class WhatsAppOAuthProvider implements OAuthServerProvider {
     }
 
     const redirect = new URL(decision.redirectUri);
+    // Per OAuth 2.1, state must be echoed back on both the success and
+    // error redirect when the client sent one — Claude's own callback
+    // validates this and rejects the redirect otherwise ("state: Field
+    // required"), so this isn't optional even though AuthorizationParams
+    // types it as such.
+    if (decision.state) redirect.searchParams.set("state", decision.state);
 
     if (!allow) {
       redirect.searchParams.set("error", "access_denied");
