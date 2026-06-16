@@ -1,16 +1,24 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import express from "express";
 import { z } from "zod";
 import dotenv from "dotenv";
 import { EvolutionClient } from "./client.js";
+import { InMemoryClientsStore, WhatsAppOAuthProvider } from "./auth.js";
 
 // Load environment variables for local testing
 dotenv.config();
 
 const apiUrl = process.env.EVOLUTION_API_URL;
 const globalKey = process.env.EVOLUTION_GLOBAL_KEY;
+// The externally reachable base URL of THIS server (not Evolution's URL).
+// Needed as the OAuth issuer/resource identifier — clients fetch
+// <PUBLIC_URL>/.well-known/oauth-authorization-server during discovery, so
+// it must be the exact public address, e.g. https://your-app.easypanel.host
+const publicUrl = process.env.PUBLIC_URL;
 
 if (!apiUrl || !globalKey) {
   console.error(
@@ -19,8 +27,20 @@ if (!apiUrl || !globalKey) {
   process.exit(1);
 }
 
+if (!publicUrl) {
+  console.error(
+    "Error: PUBLIC_URL environment variable is required (the externally reachable base URL of this deployment, e.g. https://your-app.easypanel.host) — used as the OAuth issuer."
+  );
+  process.exit(1);
+}
+
 // Initialize the Evolution API client
 const client = new EvolutionClient(apiUrl, globalKey);
+
+// Single shared OAuth provider for the whole process — every SSE connection
+// reuses it (only the McpServer itself needs to be per-connection, see
+// createServer() below).
+const oauthProvider = new WhatsAppOAuthProvider(new InMemoryClientsStore());
 
 // Helper for error formatting in tool responses
 const wrapResult = async (fn: () => Promise<any>) => {
@@ -288,7 +308,49 @@ function createServer(): McpServer {
 // Start the server with Express and SSE transport
 async function run() {
   const app = express();
+
+  // Mounts /authorize, /token, /register, /revoke,
+  // /.well-known/oauth-authorization-server and
+  // /.well-known/oauth-protected-resource. Must be installed at the app
+  // root per the SDK's own doc comment, and before express.json() below
+  // (the auth handlers parse bodies themselves).
+  app.use(
+    mcpAuthRouter({
+      provider: oauthProvider,
+      issuerUrl: new URL(publicUrl!),
+      resourceName: "WhatsApp Evolution MCP",
+      scopesSupported: ["whatsapp"],
+    })
+  );
+
+  // Consent screen submits here. Not part of the SDK router — this is the
+  // human-in-the-loop step before authorize() hands back a code.
+  app.post("/authorize/decision", express.urlencoded({ extended: false }), (req, res) => {
+    const decisionId = req.body?.decisionId as string | undefined;
+    const allow = req.body?.decision === "allow";
+    if (!decisionId) {
+      res.status(400).send("Missing decisionId");
+      return;
+    }
+    try {
+      const { redirectUrl } = oauthProvider.resolveDecision(decisionId, allow);
+      res.redirect(redirectUrl);
+    } catch (err: any) {
+      res.status(400).send(err.message || "Decisão inválida");
+    }
+  });
+
   app.use(express.json());
+
+  // No requiredScopes: this server has a single purpose (WhatsApp tools),
+  // there's no partial-access tier to gate behind a scope, and several MCP
+  // clients don't pass `scope` in the /authorize request at all — requiring
+  // one would lock them out for no real benefit. "whatsapp" in
+  // scopesSupported above is informational only.
+  const bearerAuth = requireBearerAuth({
+    verifier: oauthProvider,
+    resourceMetadataUrl: new URL("/.well-known/oauth-protected-resource", publicUrl!).href,
+  });
 
   // One transport per SSE connection, keyed by the sessionId the SDK embeds
   // in the "endpoint" event it sends on connect (/messages?sessionId=...).
@@ -296,7 +358,7 @@ async function run() {
   // silently steal routing for POST /messages away from the first.
   const transports = new Map<string, SSEServerTransport>();
 
-  app.get("/sse", async (req, res) => {
+  app.get("/sse", bearerAuth, async (req, res) => {
     console.log("New SSE connection established");
     const transport = new SSEServerTransport("/messages", res);
     transports.set(transport.sessionId, transport);
@@ -310,7 +372,7 @@ async function run() {
     await server.connect(transport);
   });
 
-  app.post("/messages", async (req, res) => {
+  app.post("/messages", bearerAuth, async (req, res) => {
     const sessionId = req.query.sessionId as string | undefined;
     const transport = sessionId ? transports.get(sessionId) : undefined;
     if (!transport) {
@@ -322,8 +384,9 @@ async function run() {
 
   const port = process.env.PORT || 3000;
   app.listen(port, () => {
-    console.log(`WhatsApp Evolution API MCP Server running on port ${port} (SSE Transport)`);
-    console.log(`SSE URL: http://localhost:${port}/sse`);
+    console.log(`WhatsApp Evolution API MCP Server running on port ${port} (SSE Transport, OAuth-protected)`);
+    console.log(`SSE URL: ${publicUrl}/sse`);
+    console.log(`OAuth issuer: ${publicUrl}`);
   });
 }
 
