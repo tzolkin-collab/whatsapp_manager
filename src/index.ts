@@ -366,9 +366,9 @@ async function run() {
     const originalWrite = res.write;
     res.write = function(chunk: any, ...args: any[]) {
       if (typeof chunk === "string" && chunk.startsWith("event: endpoint\ndata: /messages")) {
-        chunk = chunk.replace("data: /messages", \`data: \${publicUrl}/messages\`);
+        chunk = chunk.replace("data: /messages", `data: ${publicUrl}/messages`);
       }
-      return originalWrite.apply(res, [chunk, ...args]);
+      return (originalWrite as any).apply(res, [chunk, ...args]);
     };
 
     const transport = new SSEServerTransport(messagesUrl, res);
