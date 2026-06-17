@@ -360,7 +360,8 @@ async function run() {
 
   app.get("/sse", bearerAuth, async (req, res) => {
     console.log("New SSE connection established");
-    const transport = new SSEServerTransport("/messages", res);
+    const messagesUrl = new URL("/messages", publicUrl!).href;
+    const transport = new SSEServerTransport(messagesUrl, res);
     transports.set(transport.sessionId, transport);
 
     res.on("close", () => {
