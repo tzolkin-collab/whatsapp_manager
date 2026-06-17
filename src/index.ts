@@ -381,7 +381,7 @@ async function run() {
   // silently steal routing for POST /messages away from the first.
   const transports = new Map<string, SSEServerTransport>();
 
-  app.get("/sse", customAuth, async (req, res) => {
+  app.get("/sse", async (req, res) => {
     console.log("New SSE connection established");
     const messagesUrl = new URL("/messages", publicUrl!).href;
     
@@ -407,7 +407,7 @@ async function run() {
     await server.connect(transport);
   });
 
-  app.post("/messages", customAuth, async (req, res) => {
+  app.post("/messages", async (req, res) => {
     const sessionId = req.query.sessionId as string | undefined;
     const transport = sessionId ? transports.get(sessionId) : undefined;
     if (!transport) {
