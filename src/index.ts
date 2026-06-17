@@ -340,7 +340,6 @@ async function run() {
     }
   });
 
-  app.use(express.json());
 
   // No requiredScopes: this server has a single purpose (WhatsApp tools),
   // there's no partial-access tier to gate behind a scope, and several MCP
