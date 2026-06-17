@@ -346,10 +346,34 @@ async function run() {
   // clients don't pass `scope` in the /authorize request at all — requiring
   // one would lock them out for no real benefit. "whatsapp" in
   // scopesSupported above is informational only.
-  const bearerAuth = requireBearerAuth({
-    verifier: oauthProvider,
-    resourceMetadataUrl: new URL("/.well-known/oauth-protected-resource", publicUrl!).href,
-  });
+  const customAuth = async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    try {
+      // If it's a POST to /messages with a valid sessionId, allow it (UUID acts as a session token)
+      if (req.path === '/messages' && req.query.sessionId) {
+        const sessionId = req.query.sessionId as string;
+        if (transports.has(sessionId)) {
+          return next();
+        }
+      }
+
+      let token = req.query.token as string;
+      if (!token) {
+        const authHeader = req.headers.authorization;
+        if (authHeader && authHeader.toLowerCase().startsWith('bearer ')) {
+          token = authHeader.split(' ')[1];
+        }
+      }
+      if (!token) {
+        res.status(401).json({ error: "invalid_token", error_description: "Missing token" });
+        return;
+      }
+      const authInfo = await oauthProvider.verifyAccessToken(token);
+      (req as any).auth = authInfo;
+      next();
+    } catch (err: any) {
+      res.status(401).json({ error: "invalid_token", error_description: err.message });
+    }
+  };
 
   // One transport per SSE connection, keyed by the sessionId the SDK embeds
   // in the "endpoint" event it sends on connect (/messages?sessionId=...).
@@ -357,7 +381,7 @@ async function run() {
   // silently steal routing for POST /messages away from the first.
   const transports = new Map<string, SSEServerTransport>();
 
-  app.get("/sse", bearerAuth, async (req, res) => {
+  app.get("/sse", customAuth, async (req, res) => {
     console.log("New SSE connection established");
     const messagesUrl = new URL("/messages", publicUrl!).href;
     
@@ -383,7 +407,7 @@ async function run() {
     await server.connect(transport);
   });
 
-  app.post("/messages", bearerAuth, async (req, res) => {
+  app.post("/messages", customAuth, async (req, res) => {
     const sessionId = req.query.sessionId as string | undefined;
     const transport = sessionId ? transports.get(sessionId) : undefined;
     if (!transport) {
