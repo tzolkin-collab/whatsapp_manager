@@ -360,6 +360,17 @@ async function run() {
   app.get("/sse", bearerAuth, async (req, res) => {
     console.log("New SSE connection established");
     const messagesUrl = new URL("/messages", publicUrl!).href;
+    
+    // Monkey-patch res.write to bypass @modelcontextprotocol/sdk stripping the host!
+    // The IDE's Rust MCP client has a bug parsing relative URLs and drops the sessionId.
+    const originalWrite = res.write;
+    res.write = function(chunk: any, ...args: any[]) {
+      if (typeof chunk === "string" && chunk.startsWith("event: endpoint\ndata: /messages")) {
+        chunk = chunk.replace("data: /messages", \`data: \${publicUrl}/messages\`);
+      }
+      return originalWrite.apply(res, [chunk, ...args]);
+    };
+
     const transport = new SSEServerTransport(messagesUrl, res);
     transports.set(transport.sessionId, transport);
 
