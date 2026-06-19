@@ -65,9 +65,12 @@ export interface ConfigureWebhookPayload {
 }
 
 export interface FetchMessagesPayload {
-  where?: any;
-  limit?: number;
-  offset?: number;
+  /** Filter to a single chat. Sent to Evolution as where.key.remoteJid. */
+  remoteJid?: string;
+  /** 1-based page number. */
+  page?: number;
+  /** Messages per page (Evolution's `offset`). */
+  pageSize?: number;
 }
 
 export class EvolutionClient {
@@ -163,8 +166,22 @@ export class EvolutionClient {
 
   async getMessages(instanceName: string, payload: FetchMessagesPayload = {}) {
     try {
-      // In Evolution API v2, fetching messages is typically a POST to /chat/findMessages/:instance
-      const response = await this.axiosInstance.post(`/chat/findMessages/${instanceName}`, payload);
+      // Evolution API v2: POST /chat/findMessages/:instance, response shape
+      // { messages: { total, pages, currentPage, records } }.
+      const body: Record<string, any> = {
+        // `page` is the 1-based page number; `offset` is the page size
+        // (records per page). Default to a small page so triage calls don't
+        // pull the entire ~50-message global window on every request.
+        page: payload.page ?? 1,
+        offset: payload.pageSize ?? 20,
+      };
+      // The filter must be nested under where.key, mirroring the Baileys
+      // message key shape ({ key: { remoteJid, fromMe, id } }) that each
+      // record carries. A flat { where: { remoteJid } } is silently ignored.
+      if (payload.remoteJid) {
+        body.where = { key: { remoteJid: payload.remoteJid } };
+      }
+      const response = await this.axiosInstance.post(`/chat/findMessages/${instanceName}`, body);
       return response.data;
     } catch (error: any) {
       this.handleError("getMessages", error);
